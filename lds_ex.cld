@@ -1,0 +1,27 @@
+; which format should we use (poff/prt or bin)
+FORMAT BINARY
+
+; emitted binary size must be 0x1000 bytes long
+OUTPUT SIZE 0x1000
+
+; segment 00 is the ram segment, read write only
+; 0x1000 bytes long
+SEGMENT 0x00 RAM [RW] LENGTH 0x1000
+
+; segment 01 is the rom segment, read execute only
+; 0x1000 bytes long
+SEGMENT 0x01 ROM [RX] LENGTH 0x1000
+
+; section text must be in the rom segment
+; text must appear at offset 0x0050 within the segment
+SECTION TEXT [ROM] ORIGIN 0x0050 TYPE EXECUTABLE
+
+; section data must be in the ram segment
+; data must appear at offset 0x0000 within the segment
+SECTION DATA [RAM] ORIGIN 0x0000 TYPE DATA
+
+; section rodata must be in the rom segment
+; data may be anywhere within the segment, so long as there is space
+SECTION RODATA [ROM] TYPE DATA
+
+ENTRY TEXT _entry

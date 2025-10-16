@@ -1,0 +1,6 @@
+-Iinclude
+-std=c17
+-Wall
+-Wextra 
+-I/home/korvo/.hewg/packages/crow.POFF_c-0.1.0:x86-linux-gnu/include
+-I/home/korvo/.hewg/packages/crow.crowcpu_arch-0.1.0:x86-linux-gnu/include

@@ -1,0 +1,9 @@
+segments {
+	"CODE" [rx] size=0x1000 id=0x00
+	"DATA" [rw] size=0x1000 id=0x01
+}
+
+sections {
+	"code" >CODE
+	"data" >DATA
+}

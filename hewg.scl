@@ -1,0 +1,27 @@
+[hewg]
+version =  "0.4.0-alpha.nd"
+type = "executable"
+
+[project]
+version = "0.0.1"
+org = "crow"
+name = "ccc_crowcpu_ld"
+description = ""
+authors = { }
+
+[depends]
+internal = { "=crow.POFF_c-0.1.0" "=crow.crowcpu_arch-0.1.0" }
+external = { }
+
+[cxx]
+flags = { "-Wall" "-Wextra" "-Werror" }
+std = 23
+sources = { }
+
+[c]
+flags = { "-Wall" "-Wextra" "-Werror" }
+std = 17
+sources = { "main.c" }
+
+[hooks.prebuild]
+[hooks.postbuild]
