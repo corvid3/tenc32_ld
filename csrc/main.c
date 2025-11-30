@@ -1,553 +1,721 @@
-#include <asm-generic/errno-base.h>
+#include "crow.crowcpu_arch/crowcpu_arch.h"
+#include "script.h"
+#include "symbol.h"
+#include "y.tab.h"
+#include <assert.h>
 #include <crow.POFF_c/POFF_c.h>
-#include <crow.crowcpu_arch/crowcpu_arch.h>
-#include <ctype.h>
-#include <errno.h>
 #include <getopt.h>
-#include <stddef.h>
-#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
-#define PANIC(fmt) fputs(fmt "\n", stderr), abort();
-#define MAX_OBJECT_FILES 1
-#define MAX_UNQIUE_SECTIONS 256
-#define THIS_VERSION 0
-#define MAX_SCRIPT_LINE_LENGTH 128
+#define MAX_INPUT_FILES 8
+#define ALIGNTO(x, y) ((y - (x % y)) % y)
+#define PADTO(x, y) (x + ALIGNTO(x, y))
 
-typedef enum
+/* the symbol tables of each file get updated with the
+ * newly calculated offset into the output file
+ * so that relocations in other files know what
+ * the actual offset will be in the final file.
+ * however, when a file link edits a relocation within itself
+ * to a symbol within itself, it needs to know
+ * the absolute offset into its relative buffer.
+ * we do this by storing the assigned offset of each section
+ * and then subtracting it from the updated offset of the symbol and
+ * relocation information */
+struct input_file_section_misc
 {
-  FORMAT_BINARY,
-  FORMAT_PRT,
-} output_format;
+  unsigned assigned_offset;
+};
 
-typedef struct
+struct input_file
 {
-  uint32_t size;
+  char const* name;
+  poff_file_t filedata;
+  struct input_file_section_misc* misc_section_data;
+};
 
-  /* supplied by linker scripts,
-   * adjusts the offsets of symbol resolution */
-  uint32_t paddr;
-} ld_merged_section_info_t;
-
-typedef struct
+struct symbol_information
 {
-  output_format format;
+  char const* name;
+  unsigned offset;
+  unsigned segment_selector;
+};
 
-  // which sections to emit
-  _Bool enable_output[POFF_SECTION_SENTINEL];
-  uint32_t maximum_length[POFF_SECTION_SENTINEL];
-  uint32_t physical_offset[POFF_SECTION_SENTINEL];
-} ld_script_t;
+static struct input_file files[MAX_INPUT_FILES];
+static unsigned num_files = 0;
+extern FILE* yyin;
 
-static ld_merged_section_info_t merged_sections[POFF_SECTION_SENTINEL];
-
-static char* input_paths[MAX_OBJECT_FILES];
-static int num_object_files;
-static poff_file_t files[MAX_OBJECT_FILES];
-
-static _Bool use_script = 0;
-static ld_script_t script;
-
-static _Bool
-would_overflow(uint32_t a, uint32_t b)
+static void
+assert_no_clashing_segment_selectors()
 {
-  return a > UINT32_MAX - b;
+  struct script_segment* seg = script_segment_head;
+
+  while (seg) {
+    struct script_segment* seg2 = seg->next;
+    while (seg2) {
+      if (seg->selector == seg2->selector)
+        fprintf(stderr,
+                "overlapping segment selectors for segments <%s> and <%s>\n",
+                seg->name,
+                seg2->name),
+          exit(1);
+
+      seg2 = seg2->next;
+    }
+    seg = seg->next;
+  }
 }
 
-static output_format
-parse_output_format(char const* in)
-{
-  if (strcmp(in, "bin") == 0)
-    return FORMAT_BINARY;
+// static void
+// assert_no_overlapping_sections()
+// {
+//   struct script_section* section = script_section_head;
 
-  PANIC("unknown format");
+//   while (section) {
+//     struct script_section* section2 = section->next;
+
+//     while (section2) {
+//       if (strcmp(section->name, section2->name) == 0)
+//         continue;
+
+//       section2 = section2->next;
+//     }
+
+//     section = section->next;
+//   }
+// }
+
+/* assert that there are no relocations within any of the files
+ * that point to sections that are not in the output file
+ */
+static void
+assert_no_invalid_relocations()
+{
+  for (unsigned i = 0; i < num_files; i++) {
+    struct input_file file = files[i];
+
+    if (file.filedata.shortcuts.srel == NULL)
+      continue;
+
+    for (unsigned i = 0; i < file.filedata.shortcuts.srel->size; i++) {
+      poff_relocation_t* rel = &file.filedata.shortcuts.srel->relocations[i];
+      char const* section_name = file.filedata.section_names[rel->section].data;
+
+      if (find_section(section_name) == NULL)
+        fprintf(stderr,
+                "input file %s contains relocation to non-output section %s\n",
+                file.name,
+                file.filedata.section_names[rel->section].data),
+          exit(1);
+    }
+  }
 }
 
-static ld_script_t
-load_linker_script(char* filepath)
+static void
+assert_symbol_collisions()
 {
-  FILE* file = fopen(filepath, "rb");
-  static char linebuf[MAX_SCRIPT_LINE_LENGTH];
-  static char str[64];
-  static int num;
+  for (unsigned i = 0; i < num_files; i++) {
+    poff_strtab_data_t* strtab = files[i].filedata.shortcuts.strtab;
+    poff_symtab_data_t* symtab = files[i].filedata.shortcuts.symtab;
 
-  ld_script_t out = { 0 };
+    for (unsigned j = 0; j < symtab->size; j++) {
+      poff_symbol_t sym = symtab->symbols[j];
 
-  while (fgets(linebuf, MAX_SCRIPT_LINE_LENGTH, file)) {
-    if (feof(file))
+      /* skip any extern references */
+      if (sym.flags & POFF_SYMBOL_EXTERNAL)
+        continue;
+
+      for (unsigned k = i + 1; k < num_files; k++) {
+        unsigned out;
+        if (poff_find_symbol(&files[k].filedata,
+                             strtab->strings[sym.name].data,
+                             &out) == POFF_NO_SUCH_THING)
+          continue;
+
+        if (!(files[k].filedata.shortcuts.symtab->symbols[out].flags &
+              POFF_SYMBOL_EXTERNAL))
+          fprintf(stderr,
+                  "redeclaration of symbol %s\n",
+                  strtab->strings[sym.name].data),
+            exit(1);
+      }
+    }
+  }
+}
+
+void
+instr_reloc(uint32_t* word, uint32_t addr)
+{
+  tenc32_arch_decoded_instruction instr;
+
+  if (!tenc32_arch_decode(&instr, *word))
+    fprintf(stderr, "invalid instruction\n"), exit(1);
+
+  switch (instr.instruction) {
+    case TENC32_DECODED_MOVE:
+      assert(instr.addressing == TENC32_ADDRESSING_MOVE_REG_IMM);
+      instr.payload.move_reg_imm.imm = addr;
       break;
 
-    if (strchr(linebuf, '\n') == NULL)
-      PANIC("line too long in linker script");
+    case TENC32_DECODED_SUB:
+      if (instr.addressing == TENC32_ADDRESSING_ARITHMETIC_IMMEDIATE_REGISTER)
+        instr.payload.arithmetic_constant_reg.lhs += addr;
+      else if (instr.addressing ==
+               TENC32_ADDRESSING_ARITHMETIC_REGISTER_IMMEDIATE)
+        instr.payload.arithmetic_reg_constant.rhs += addr;
+      else
+        assert(false);
+      break;
 
-    // skip empty lines
-    if (strlen(linebuf) == 1)
-      continue;
+    case TENC32_DECODED_ADD:
+      if (instr.addressing == TENC32_ADDRESSING_ARITHMETIC_IMMEDIATE_REGISTER)
+        instr.payload.arithmetic_constant_reg.lhs = addr;
+      else if (instr.addressing ==
+               TENC32_ADDRESSING_ARITHMETIC_REGISTER_IMMEDIATE)
+        instr.payload.arithmetic_reg_constant.rhs = addr;
+      else
+        assert(false);
+      break;
 
-    // skip comments, may only be on their own line
-    char* first_semi = strchr(linebuf, ';');
-    if (first_semi != NULL) {
-      // assert that semi must be the first non-whitespace char
-      for (char* i = linebuf; i < first_semi; i++)
-        if (!isspace(*i))
-          PANIC("semicolon comments must be on their own line, at the very "
-                "beginning");
-    }
+    case TENC32_DECODED_CALL:
+      assert(instr.addressing == TENC32_ADDRESSING_CALL_IMMEDIATE);
+      instr.payload.call_direct.offset = addr;
+      break;
 
-    if (sscanf(linebuf, "FORMAT %63s", str) == 1)
-      out.format = parse_output_format(str);
-    else if (sscanf(linebuf, "USE %63s", str) == 1) {
-      poff_section_type sect = poff_get_section_type_by_name(str);
-      out.enable_output[sect] = 1;
-    } else if (sscanf("%63s -> LENGTH = %i", str, num) == 1) {
-      poff_section_type sect = poff_get_section_type_by_name(str);
-      out.maximum_length[sect] = num;
-    } else if (sscanf("%63s -> ORIGIN = %i", str, num) == 1) {
-      poff_section_type sect = poff_get_section_type_by_name(str);
-      out.physical_offset[sect] = num;
-    } else
-      PANIC("unknown syntax in linker file");
+    case TENC32_DECODED_TEST:
+    case TENC32_DECODED_AND:
+    case TENC32_DECODED_OR:
+    case TENC32_DECODED_XOR:
+    case TENC32_DECODED_NOT:
+    case TENC32_DECODED_SHIFT_LEFT:
+    case TENC32_DECODED_SHIFT_RIGHT:
+    case TENC32_DECODED_SYSJUMP:
+    case TENC32_DECODED_HALT:
+    case TENC32_DECODED_LOAD:
+    case TENC32_DECODED_STORE:
+    case TENC32_DECODED_PUSH:
+    case TENC32_DECODED_POP:
+    case TENC32_DECODED_SYSINT:
+    case TENC32_DECODED_SYSINTRET:
+    case TENC32_DECODED_LCR:
+    case TENC32_DECODED_SCR:
+      assert(false);
   }
 
-  fclose(file);
+  *word = tenc32_arch_encode(&instr);
+}
 
-  /* some quick sanity checks, no overlapping sections */
-  for (poff_section_type section = 0; section < POFF_SECTION_SENTINEL;
-       section++) {
+static void
+falignto(FILE* file, unsigned alignment)
+{
+  unsigned length = ftell(file);
+  for (unsigned i = 0; i < (alignment - length % alignment) % alignment; i++)
+    fputc(0, file);
+}
 
-    if (!out.enable_output[section])
-      continue;
+static void
+walistr(FILE* file, char const* what)
+{
+  unsigned len = strlen(what);
+  fwrite(&len, sizeof len, 1, file);
+  fwrite(what, 1, len, file);
+  falignto(file, 4);
+}
 
-    for (poff_section_type section2 = 0; section2 < POFF_SECTION_SENTINEL;
-         section2++) {
-      if (!out.enable_output[section2])
+char const*
+reltypestr(poff_relocation_type ty)
+{
+  switch (ty) {
+    case POFF_RELOCATION_10c32_MEMORY:
+      return "MEM";
+
+    case POFF_RELOCATION_10c32_INSTR_HIGH:
+      return "HI";
+
+    case POFF_RELOCATION_10c32_INSTR_LOW:
+      return "LO";
+
+    case POFF_RELOCATION_10c32_INSTR_PC_DISTANCE:
+      return "DIST";
+
+    case POFF_RELOCATION_10c32_INSTR_PC_RELATIVE:
+      return "REL";
+
+    default:
+      assert(false);
+  }
+}
+
+[[maybe_unused]] static void
+dump_relocations(poff_file_t* file)
+{
+  for (unsigned i = 0; i < file->shortcuts.srel->size; i++) {
+    poff_relocation_t rel = file->shortcuts.srel->relocations[i];
+    poff_symbol_t sym = file->shortcuts.symtab->symbols[rel.symbol];
+    printf("REL: <%s.%s> -> <%s> %s\n",
+           file->section_names[sym.section].data,
+           file->shortcuts.strtab->strings[sym.name].data,
+           file->section_names[rel.section].data,
+           reltypestr(rel.type));
+  }
+}
+
+static void
+init_script(char const* filename)
+{
+  FILE* script_file = NULL;
+
+  if (filename && access(filename, R_OK) == -1)
+    fprintf(stderr, "unable to open linker script %s\n", filename), exit(1);
+
+  if (filename)
+    script_file = fopen(filename, "r");
+  else
+    fprintf(stderr, "expected linker script, not optional\n"), exit(1);
+  assert(script_file);
+
+  /* load the linker script */
+  yyin = script_file;
+  if (yyparse() == 1)
+    exit(1);
+
+  fclose(script_file);
+
+  // script_dump();
+}
+
+static void
+load_input_files(int argc, char** argv)
+{
+  for (int i = optind; i < argc; i++) {
+    if (access(argv[i], R_OK) == -1)
+      fprintf(stderr, "unable to open input file %s\n", argv[i]), exit(1);
+
+    FILE* infile = fopen(argv[i], "r");
+    assert(infile);
+    struct input_file* f = &files[num_files++];
+    f->name = argv[i];
+    if (poff_read_file(&f->filedata, infile) != POFF_NO_ERROR)
+      fprintf(stderr,
+              "failed while trying to read contents of poff file %s\n",
+              f->name),
+        exit(1);
+    fclose(infile);
+
+    f->misc_section_data =
+      malloc(sizeof *f->misc_section_data * f->filedata.header.num_sections);
+    for (unsigned i = 0; i < f->filedata.header.num_sections; i++)
+      f->misc_section_data[i].assigned_offset = 0;
+  }
+}
+
+static void
+calculate_offsets()
+{
+  for (struct script_section* sect = script_section_head; sect;
+       sect = sect->next) {
+    char const* name = sect->name;
+
+    for (unsigned i = 0; i < num_files; i++) {
+      struct input_file* file = &files[i];
+      uint32_t idx;
+
+      if (poff_find_section(&file->filedata, name, &idx) == POFF_NO_SUCH_THING)
         continue;
 
-      uint32_t section1_start = out.physical_offset[section];
-      uint32_t section1_end =
-        out.physical_offset[section] + out.maximum_length[section];
-
-      uint32_t section2_start = out.physical_offset[section2];
-      uint32_t section2_end =
-        out.physical_offset[section2] + out.maximum_length[section2];
-
-      if ((section1_start <= section2_end && section1_end >= section2_start) ||
-          (section2_start <= section1_end && section2_end >= section1_start))
-        PANIC("overlapping sections in linker script");
-    }
-  }
-
-  return out;
-}
-
-static void
-init_merged_sections()
-{
-  for (int i = 0; i < POFF_SECTION_SENTINEL; i++) {
-    ld_merged_section_info_t* merged = &merged_sections[i];
-    merged->size = 0;
-    merged->paddr = 0;
-  }
-}
-
-/* also calculates per-section offset per-file */
-static void
-calculate_merged_section_offsets()
-{
-  /* first, calculate the total merged sections sizes */
-  for (int i = 0; i < num_object_files; i++) {
-    poff_file_t* file = &files[i];
-
-    for (int j = 0; j < POFF_SECTION_SENTINEL; j++) {
-      poff_section_t* section = &file->sections[i];
-      ld_merged_section_info_t* merged = &merged_sections[i];
-
-      if (would_overflow(merged->size, section->size))
-        PANIC("merged section would overflow");
-
-      section->ld.assigned_offset = merged->size;
-      merged->size += section->size;
-    }
-  }
-
-  if (use_script) {
-    for (poff_section_type sect = 0; sect < POFF_SECTION_SENTINEL; sect++) {
-      uint32_t merged_size = merged_sections[sect].size;
-      uint32_t limit = script.maximum_length[sect];
-
-      if (merged_size > limit)
-        PANIC("section is too large");
-
-      merged_sections[sect].paddr = script.physical_offset[sect];
-    }
-  }
-}
-
-/* does not assert that there are no overlapping symbol names */
-
-static void
-discover_symbol_collisions()
-{
-  for (int i = 0; i < num_object_files; i++) {
-    poff_file_t* file = &files[i];
-
-    for (uint32_t j = 0; j < file->header.num_symbols; j++) {
-      poff_symbol_t* sym = &file->symbols[i];
-
-      /* symbol re-definitions within POFF files */
-      for (uint32_t k = j + 1; k < file->header.num_symbols; k++) {
-        poff_symbol_t* sym2 = &file->symbols[k];
-
-        if (sym->name_len != sym2->name_len)
-          continue;
-
-        if (memcmp(sym->name, sym2->name, sym->name_len) != 0)
-          continue;
-
-        fprintf(
-          stderr, "redefinition of symbol %.*s\n", sym->name_len, sym->name);
-        abort();
-      }
-
-      /* symbol re-definitions between POFF files */
-      /* disregard internal symbols, we only care about global defns */
-      if (sym->type != POFF_SYMBOL_INTERNAL &&
-          sym->type != POFF_SYMBOL_EXTERNAL)
-        continue;
-
-      poff_symbol_t* sym2 = NULL;
-
-      /* TODO: can memoize true results by maintaining a list of symbols
-       * that have so far succeeded
+      /* for each symbol or relocation which references this
+       * section, we must update their offsets by the current size
+       * of the target segment.
        */
 
-      /* discover unresolved external references */
-      for (int k = 0; k < num_object_files; k++) {
-        poff_file_t* file = &files[i];
-        sym2 = find_symbol(file, sym->name, sym->name_len, POFF_SYMBOL_GLOBAL);
-        if (sym2 != NULL)
-          break;
-      }
+      if (file->filedata.shortcuts.symtab) {
+        poff_symtab_data_t* symtab = file->filedata.shortcuts.symtab;
+        for (unsigned j = 0; j < symtab->size; j++) {
+          poff_symbol_t* symbol = &symtab->symbols[j];
 
-      if (sym2 == NULL) {
-        fprintf(stderr, "unresolved symbol %.*s\n", sym->name_len, sym->name);
-        abort();
-      }
-
-      /* discover overlapping global references */
-      if (sym2->type == POFF_SYMBOL_GLOBAL) {
-        for (int k = 0; k < num_object_files; k++) {
-          poff_file_t* file2 = &files[k];
-
-          if (file2 == file)
+          if (strcmp(file->filedata.section_names[symbol->section].data,
+                     sect->name))
             continue;
 
-          poff_symbol_t* sym2 =
-            find_symbol(file2, sym->name, sym->name_len, sym->type);
-          if (sym2 != NULL) {
-            fprintf(stderr,
-                    "redefinition of global symbol %.*s\n",
-                    sym->name_len,
-                    sym->name);
-            abort();
+          symbol->offset += sect->length;
+
+          if (symbol->flags & POFF_SYMBOL_EXTERNAL) {
+            declare_symbol(
+              file->filedata.shortcuts.strtab->strings[symbol->name].data);
+          } else if (symbol->flags & POFF_SYMBOL_GLOBAL) {
+            define_visible_symbol(
+              file->filedata.shortcuts.strtab->strings[symbol->name].data,
+              file->filedata.section_names[symbol->section].data,
+              symbol->offset);
+          } else {
+            define_static_symbol(
+              file->filedata.shortcuts.strtab->strings[symbol->name].data,
+              file->filedata.section_names[symbol->section].data,
+              symbol->offset);
           }
         }
       }
+
+      file->misc_section_data[idx].assigned_offset = sect->length;
+      sect->length += file->filedata.sections[idx].header.size;
     }
   }
 }
 
 static void
-apply_relocation(poff_file_t* file,
-                 poff_section_type section,
-                 uint32_t at,
-                 uint32_t new_address)
+relocate()
 {
-  // relocations must be aligned to a 32 bit boundary
-  if ((at & 0x11111) != 0) {
-    fprintf(stderr, "relocations must be aligned on a 32 bit boundary\n");
-    exit(1);
-  }
+  for (unsigned i = 0; i < num_files; i++) {
+    struct input_file* file = &files[i];
 
-  if (section == POFF_TEXT) {
-    /* we have to update an instruction, rather than a word */
-    crowcpu_arch_decoded_instruction instr;
-    if (!crowcpu_arch_decode(&instr,
-                             *(uint32_t*)&file->sections[section].data[at])) {
-      fprintf(stderr, "unknown instruction at data address 0x%X\n", at);
-      exit(1);
-    }
+    poff_strtab_data_t* strtab = file->filedata.shortcuts.strtab;
+    poff_symtab_data_t* symtab = file->filedata.shortcuts.symtab;
+    poff_srel_data_t* srel = file->filedata.shortcuts.srel;
 
-    /* TODO: should it error on new addresses larger than the imm? */
+    for (unsigned i = 0; i < srel->size; i++) {
+      poff_relocation_t rel = srel->relocations[i];
 
-    switch (instr.instruction) {
-      case CROWCPU_DECODED_MOVE:
-        switch (instr.addressing) {
-          case CROWCPU_ADDRESSING_MOVE_IMM_REG:
-            instr.payload.move_reg_imm.imm = new_address;
-            break;
+      assert(rel.offset % 4 == 0);
 
-          default:
-            fprintf(stderr, "invalid addressing mode\n");
-            exit(1);
-            break;
-        }
-        break;
+      poff_symbol_t* relsym = &symtab->symbols[rel.symbol];
 
-      case CROWCPU_DECODED_LOAD:
-      case CROWCPU_DECODED_STORE:
-        switch (instr.addressing) {
-          case CROWCPU_ADDRESSING_MEMORY_CONSTANT:
-            instr.payload.mem_reg_constant.constant = new_address;
-            break;
+      char const* rel_symbol_name = strtab->strings[relsym->name].data;
+      char const* rel_symbol_section =
+        file->filedata.section_names[relsym->section].data;
+      char const* rel_into_section_name =
+        file->filedata.section_names[rel.section].data;
 
-          default:
-            fprintf(stderr, "invalid addressing mode\n");
-            exit(1);
-            break;
-        }
-        break;
+      // printf("relocating <%s.%s> to <%s> with %s\n",
+      //        rel_symbol_section,
+      //        rel_symbol_name,
+      //        rel_into_section_name,
+      //        reltypestr(rel.type));
 
-      case CROWCPU_DECODED_TEST:
-      case CROWCPU_DECODED_ADD:
-      case CROWCPU_DECODED_SUB:
-      case CROWCPU_DECODED_AND:
-      case CROWCPU_DECODED_OR:
-      case CROWCPU_DECODED_XOR:
-      case CROWCPU_DECODED_SHIFT_LEFT:
-      case CROWCPU_DECODED_SHIFT_RIGHT:
-      case CROWCPU_DECODED_ROTATE_LEFT:
-      case CROWCPU_DECODED_ROTATE_RIGHT:
-        switch (instr.addressing) {
-          case CROWCPU_ADDRESSING_ARITHMETIC_IMMEDIATE_REGISTER:
-            instr.payload.arithmetic_constant_reg.constant = new_address;
-            break;
+      /* for segments that which are not exported,
+       * do not apply relocations if there is relocations from
+       * a non-exported segment to a non-exported segment
+       * however, it is an error to relocate a pointer
+       * in an exported segment to a segment not exported
+       */
 
-          case CROWCPU_ADDRESSING_ARITHMETIC_REGISTER_IMMEDIATE:
-            instr.payload.arithmetic_reg_constant.constant = new_address;
-            break;
-
-          default:
-            fprintf(stderr, "invalid addressing mode\n");
-            exit(1);
-            break;
-        }
-        break;
-
-      case CROWCPU_DECODED_NOOP:
-      case CROWCPU_DECODED_NOT:
-      case CROWCPU_DECODED_LOAD_GLOBAL_SEGMENT_TABLE:
-      case CROWCPU_DECODED_LOAD_LOCAL_SEGMENT_TABLE:
-      case CROWCPU_DECODED_LOAD_INTERRUPT_DESCRIPTOR_TABLE:
-      case CROWCPU_DECODED_HALT:
-        fprintf(stderr, "illegal instruction in linking procedure\n");
+      if (find_segment(rel_symbol_section) &&
+          !find_segment(rel_into_section_name)) {
+        fprintf(stderr,
+                "invalid relocation to a non-exported section, %s to %s\n",
+                rel_symbol_section,
+                rel_into_section_name);
         exit(1);
-        break;
-    }
+      }
 
-    *(uint32_t*)&file->sections[section].data[at] = crowcpu_arch_encode(&instr);
-  } else {
-    memcpy(
-      &file->sections[section].data[at], &new_address, sizeof(new_address));
-  }
-}
+      if (!find_segment(rel_symbol_section))
+        continue;
 
-static void
-link_internal_references(poff_file_t* file)
-{
-  for (uint32_t i = 0; i < file->header.num_relocations; i++) {
-    poff_relocation_t* rel = &file->relocations[i];
-    poff_symbol_t* sym = &file->symbols[rel->symbol];
+      struct symbol* sym;
 
-    // we only want to deal with declared symbols right now
-    if (sym->type == POFF_SYMBOL_EXTERNAL)
-      continue;
+      struct script_segment* point_to_seg = NULL;
+      unsigned point_to = 0;
 
-    apply_relocation(file,
-                     rel->section,
-                     rel->offset,
-                     sym->offset +
-                       file->sections[sym->section].ld.assigned_offset +
-                       merged_sections[sym->section].paddr);
-  }
-}
+      /* static sym takes precedence */
+      if ((sym = find_static_symbol(rel_symbol_name, rel_symbol_section))) {
+        point_to_seg = find_segment(sym->section);
 
-static void
-link_external_references(poff_file_t* file)
-{
-  for (uint32_t i = 0; i < file->header.num_relocations; i++) {
-    poff_relocation_t* rel = &file->relocations[i];
-    poff_symbol_t* sym = &file->symbols[rel->symbol];
+        TENC32_SET_SEGMENT(point_to, point_to_seg->selector);
+        TENC32_SET_SEGMENT_OFFSET(point_to, sym->offset);
+      } else if ((sym = find_global_symbol(rel_symbol_name))) {
+        point_to_seg = find_segment(sym->section);
 
-    poff_file_t* res_file = NULL;
-    poff_symbol_t* res_sym = NULL;
+        TENC32_SET_SEGMENT(point_to, point_to_seg->selector);
+        TENC32_SET_SEGMENT_OFFSET(point_to, sym->offset);
+      } else {
+        fprintf(stderr, "undefined symbol %s\n", rel_symbol_name);
+        exit(1);
+      }
 
-    // we only want to deal with nondeclared symbols right now
-    if (sym->type != POFF_SYMBOL_EXTERNAL)
-      continue;
+      uint32_t* wordptr = (uint32_t*)&file->filedata.sections[rel.section]
+                            .data.data.data[rel.offset];
 
-    for (int i = 0; i < num_object_files; i++) {
-      res_file = &files[i];
-      res_sym = find_symbol(file, sym->name, sym->name_len, sym->offset);
-      if (res_sym != NULL)
-        break;
-    }
+      switch (rel.type) {
+        case POFF_RELOCATION_10c32_MEMORY:
+          *wordptr = point_to;
+          break;
 
-    // locate the symbol definition
-    apply_relocation(file,
-                     rel->section,
-                     rel->offset,
-                     res_sym->offset +
-                       res_file->sections[res_sym->section].ld.assigned_offset +
-                       merged_sections[res_sym->section].paddr);
-  }
-}
+        case POFF_RELOCATION_10c32_INSTR_HIGH:
+          instr_reloc(wordptr, point_to >> 16);
+          break;
 
-static void
-link()
-{
-  for (int i = 0; i < num_object_files; i++) {
-    poff_file_t* file = &files[i];
-    link_internal_references(file);
-    link_external_references(file);
-  }
-}
+        case POFF_RELOCATION_10c32_INSTR_LOW:
+          instr_reloc(wordptr, point_to);
+          break;
 
-static void
-emit_prt()
-{
-  FILE* outfile = fopen("a.out", "w");
+        case POFF_RELOCATION_10c32_INSTR_PC_DISTANCE:
+        case POFF_RELOCATION_10c32_INSTR_PC_RELATIVE: {
+          /* for pc_distance, the point to must be within the current
+           * segment, and also must be within 16 bits of distance
+           */
+          struct script_section* instr_section =
+            find_section(rel_into_section_name);
+          struct script_segment* instr_resting_segment =
+            find_segment(instr_section->target_segment);
+          unsigned instr_resting_segment_id = instr_resting_segment->selector;
+          unsigned pc = 0;
+          TENC32_SET_SEGMENT(pc, instr_resting_segment_id);
+          TENC32_SET_SEGMENT_OFFSET(
+            pc,
+            file->misc_section_data[rel.section].assigned_offset + rel.offset);
 
-  poff_header_t header;
-  memcpy(header.magic, poff_header_magic, 4);
-  header.type = POFF_RUNTIME;
-  header.num_symbols = 0;
-  header.num_relocations = 0;
+          if (TENC32_GET_SEGMENT(pc) != TENC32_GET_SEGMENT(point_to))
+            fprintf(stderr,
+                    "distance relocation happens between multiple segments (%s "
+                    "to %s) (%i to %i)\n",
+                    instr_resting_segment->name,
+                    point_to_seg->name,
+                    TENC32_GET_SEGMENT(pc),
+                    TENC32_GET_SEGMENT(point_to)),
+              exit(1);
 
-  poff_write_header(&header, outfile);
-
-  for (poff_section_type section = 0; section < POFF_SECTION_SENTINEL;
-       section++) {
-
-    if (!script.enable_output[section])
-      continue;
-
-    for (int i = 0; i < num_object_files; i++) {
-      poff_file_t* file = &files[i];
-      poff_section_t* from = &file->sections[section];
-      poff_write_section(from, outfile);
+          if (rel.type == POFF_RELOCATION_10c32_INSTR_PC_DISTANCE)
+            instr_reloc(wordptr, abs((signed)point_to - (signed)pc));
+          else
+            instr_reloc(wordptr, (signed)point_to - (signed)pc);
+        } break;
+      }
     }
   }
-
-  fclose(outfile);
-}
-
-struct binary_sort_data
-{
-  uint32_t origin;
-  poff_section_type type;
-};
-
-static int
-sort_binary_data(void const* lhs_, void const* rhs_)
-{
-  struct binary_sort_data const* lhs = lhs_;
-  struct binary_sort_data const* rhs = rhs_;
-
-  return (lhs->origin < rhs->origin) ? -1 : 1;
 }
 
 static void
-emit_binary()
+emit(char const* outpath)
 {
-  FILE* outfile = fopen("a.out", "w");
+  FILE* outfile;
 
-  struct binary_sort_data sort_data[POFF_SECTION_SENTINEL];
+  if (outpath && access(outpath, W_OK) == -1)
+    fprintf(stderr, "unable to open output filepath %s\n", outpath), exit(1);
 
-  for (poff_section_type section = 0; section < POFF_SECTION_SENTINEL;
-       section++) {
-    sort_data[section].type = section;
-    sort_data[section].origin = merged_sections[section].paddr;
+  if (outpath)
+    outfile = fopen(outpath, "w");
+  else
+    outfile = fopen("a.out", "w");
+
+  assert(outfile);
+
+  /* poff header */
+  {
+    poff_header_t aout_hdr;
+    memcpy(aout_hdr.magic, poff_header_magic, sizeof poff_header_magic);
+    aout_hdr.version = THIS_POFF_VERSION;
+    aout_hdr.flags = POFF_HEADER_IS_EXECUTABLE;
+    aout_hdr.num_sections = 1 + num_segments();
+    aout_hdr.arch = POFF_ARCH_10c32;
+    memset(aout_hdr.reserved, 0, sizeof aout_hdr.reserved);
+
+    poff_write_header(&aout_hdr, outfile);
   }
 
-  qsort(sort_data,
-        POFF_SECTION_SENTINEL,
-        sizeof(struct binary_sort_data),
-        sort_binary_data);
+  /* section names */
+  {
+    /* prt shall be the first section in the poff file */
+    walistr(outfile, "prt");
 
-  for (int i = 0; i < POFF_SECTION_SENTINEL; i++) {
-    poff_section_type section = sort_data[i].type;
-    for (int i = 0; i < num_object_files; i++) {
-      poff_file_t* file = &files[i];
-      poff_section_t* from = &file->sections[section];
-      fwrite(from->data, from->size, 1, outfile);
+    struct script_segment* output_segments = script_segment_head;
+    for (; output_segments; output_segments = output_segments->next)
+      walistr(outfile, output_segments->name);
+  }
+
+  /* section headers */
+  {
+    falignto(outfile, POFF_SECTION_HEADERS_ALIGNMENT);
+
+    unsigned counter = ftell(outfile);
+    counter += (1 + num_segments()) * POFF_SECTION_HEADER_BYTESIZE;
+
+    /* prt header */
+    {
+      poff_section_header_t prt;
+      prt.size = POFF_10c32_RUNTIME_DATA_BYTESIZE;
+      prt.offset = counter;
+      prt.section_type = POFF_SECTION_META;
+      memset(prt.reserved, 0, sizeof prt.reserved);
+
+      counter += PADTO(prt.size, 32);
+      poff_write_section_header(&prt, outfile);
+    }
+
+    /* generated headers */
+    for (struct script_segment* segment = script_segment_head; segment;
+         segment = segment->next) {
+      poff_section_header_t hdr;
+      hdr.offset = counter;
+      hdr.section_type = POFF_SECTION_META;
+      memset(hdr.reserved, 0, sizeof hdr.reserved);
+
+      if (segment->capacity != -1u)
+        hdr.size = segment->capacity;
+      else {
+        if (segment->num_consumption == 0)
+          hdr.size = 0;
+        else {
+          hdr.size =
+            segment->consumption[segment->num_consumption - 1]->offset +
+            segment->consumption[segment->num_consumption - 1]->length;
+        }
+      }
+
+      counter += PADTO(hdr.size, 32);
+      poff_write_section_header(&hdr, outfile);
     }
   }
 
-  fclose(outfile);
+  /* section payloads */
+  {
+    /* prt payload */
+    {
+      falignto(outfile, 32);
+
+      unsigned entry = -1, code_section = -1, code = -1, data_section = -1,
+               data = -1, rodata_section = -1, rodata = -1;
+
+      if (code_segment_name) {
+        struct script_segment* seg = find_segment(code_segment_name);
+        if (!seg)
+          fprintf(
+            stderr,
+            "runtime code segment defined as segment %s, but is undefined\n",
+            code_segment_name),
+            exit(1);
+
+        if (segment_index(code_segment_name, &code_section)) {
+          code_section++;
+          code = seg->selector;
+        }
+      }
+
+      if (data_segment_name) {
+        struct script_segment* seg = find_segment(data_segment_name);
+        if (!seg)
+          fprintf(
+            stderr,
+            "runtime data segment defined as segment %s, but is undefined\n",
+            data_segment_name),
+            exit(1);
+        if (segment_index(data_segment_name, &data_section)) {
+          data_section++;
+          data = seg->selector;
+        }
+      }
+
+      if (rodata_segment_name) {
+        struct script_segment* seg = find_segment(rodata_segment_name);
+        if (!seg)
+          fprintf(
+            stderr,
+            "runtime rodata segment defined as segment %s, but is undefined\n",
+            rodata_segment_name),
+            exit(1);
+        if (segment_index(rodata_segment_name, &rodata_section)) {
+          rodata_section++;
+          rodata = seg->selector;
+        }
+      }
+
+      struct symbol* entry_sym = find_global_symbol(entry_symbol_name);
+
+      if (!entry_sym)
+        fprintf(stderr, "entry symbol <%s> undeclared\n", entry_symbol_name),
+          exit(1);
+      if (!is_global_symbol_defined(entry_symbol_name))
+        fprintf(stderr, "entry symbol <%s> undefined\n", entry_symbol_name),
+          exit(1);
+
+      struct script_section* section_sym = find_section(entry_sym->section);
+      entry = entry_sym->offset;
+
+      if (strcmp(code_segment_name, section_sym->target_segment))
+        fprintf(stderr,
+                "entry symbol %s does not appear in the code segment %s, "
+                "rather it appears in %s\n",
+                entry_symbol_name,
+                code_segment_name,
+                entry_sym->section),
+          exit(1);
+
+      fwrite(&entry, sizeof entry, 1, outfile);
+      fwrite(&code_section, sizeof code_section, 1, outfile);
+      fwrite(&code, sizeof code, 1, outfile);
+      fwrite(&data_section, sizeof data_section, 1, outfile);
+      fwrite(&data, sizeof data, 1, outfile);
+      fwrite(&rodata_section, sizeof rodata_section, 1, outfile);
+      fwrite(&rodata, sizeof rodata, 1, outfile);
+    }
+
+    /* generated segments */
+    for (struct script_segment* segment = script_segment_head; segment;
+         segment = segment->next) {
+      unsigned begin = ftell(outfile);
+      falignto(outfile, 32);
+      for (unsigned i = 0; i < segment->num_consumption; i++) {
+        struct script_section* sec = segment->consumption[i];
+
+        for (unsigned i = 0; i < num_files; i++) {
+          uint32_t idx;
+          if (poff_find_section(&files[i].filedata, sec->name, &idx) !=
+              POFF_NO_ERROR)
+            continue;
+          fwrite(files[i].filedata.sections[idx].data.data.data,
+                 1,
+                 files[i].filedata.sections[idx].header.size,
+                 outfile);
+        }
+      }
+      unsigned end = ftell(outfile);
+      if (segment->capacity != -1u) {
+        unsigned gap = segment->capacity - (end - begin);
+        for (unsigned i = 0; i < gap; i++)
+          fputc(0, outfile);
+        falignto(outfile, 32);
+      }
+    }
+  }
 }
 
 int
 main(int argc, char** argv)
 {
   char c;
-  while ((c = getopt(argc, argv, "+l:")) != -1) {
+  char const* outpath = NULL;
+  char const* linker_script_filename = NULL;
+
+  while ((c = getopt(argc, argv, "o:L:")) != -1) {
     switch (c) {
-      case 'l':
-        script = load_linker_script(optarg);
-        use_script = 1;
+      case 'o':
+        outpath = optarg;
         break;
 
-      default:
-        PANIC("unknown argument");
-    }
-  }
+      case 'L':
+        linker_script_filename = optarg;
+        break;
 
-  num_object_files = argc - optind;
-
-  if (num_object_files > MAX_OBJECT_FILES)
-    PANIC("too many object files as input, max ");
-
-  if (num_object_files == 0)
-    PANIC("suppply at least one object file to link");
-
-  // support up to four object files (eventually)
-
-  for (int i = 0; i < num_object_files; i++)
-    input_paths[i] = argv[i + optind];
-
-  for (int i = 0; i < num_object_files; i++) {
-    FILE* file = fopen(input_paths[i], "r");
-    if (file == NULL)
-      fprintf(stderr,
-              "failed to open file %s, %s\n",
-              input_paths[i],
-              strerror(errno)),
+      case '?':
+        fprintf(stderr, "unknown argument %c\n", optopt);
         exit(1);
-
-    poff_load(&files[i], file);
-
-    fclose(file);
-  }
-
-  init_merged_sections();
-  discover_symbol_collisions();
-  calculate_merged_section_offsets();
-  link();
-
-  if (!use_script)
-    emit_prt();
-  else {
-    switch (script.format) {
-      case FORMAT_BINARY:
-        emit_binary();
-        break;
-
-      case FORMAT_PRT:
-        emit_prt();
-        break;
     }
   }
+
+  if (optind == argc)
+    fprintf(stderr, "expected at least one input file\n"), exit(1);
+
+  init_script(linker_script_filename);
+  load_input_files(argc, argv);
+
+  init_symbol_table();
+  assert_no_clashing_segment_selectors();
+  assert_no_invalid_relocations();
+  assert_symbol_collisions();
+
+  calculate_offsets();
+  detect_section_overlaps();
+
+  relocate();
+  emit(outpath);
 }
