@@ -171,10 +171,10 @@ instr_reloc(uint32_t* word, uint32_t addr)
 
     case TENC32_DECODED_ADD:
       if (instr.addressing == TENC32_ADDRESSING_ARITHMETIC_IMMEDIATE_REGISTER)
-        instr.payload.arithmetic_constant_reg.lhs = addr;
+        instr.payload.arithmetic_constant_reg.lhs += addr;
       else if (instr.addressing ==
                TENC32_ADDRESSING_ARITHMETIC_REGISTER_IMMEDIATE)
-        instr.payload.arithmetic_reg_constant.rhs = addr;
+        instr.payload.arithmetic_reg_constant.rhs += addr;
       else
         assert(false);
       break;
