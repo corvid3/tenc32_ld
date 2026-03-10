@@ -102,6 +102,9 @@ find_section(char const* name);
 struct script_segment*
 find_segment(char const* name);
 
+struct script_segment*
+segment_for_section(char const* name);
+
 bool
 segment_index(char const* name, unsigned* out);
 

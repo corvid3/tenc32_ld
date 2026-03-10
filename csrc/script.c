@@ -56,6 +56,24 @@ find_segment(char const* name)
   return segment;
 }
 
+struct script_segment*
+segment_for_section(char const* name)
+{
+  struct script_segment* segment = script_segment_head;
+
+  while (segment) {
+    for (unsigned i = 0; i < segment->num_consumption; i++) {
+      if (strcmp(segment->consumption[i]->name, name) == 0)
+        goto leave;
+    }
+
+    segment = segment->next;
+  }
+
+leave:
+  return segment;
+}
+
 void
 add_script_segment(char const* name,
                    script_segment_flags flags,
@@ -166,7 +184,7 @@ parse_segment_flags(char const* in)
 unsigned
 parse_dec(char const* in)
 {
-  char* endptr;
+  char* endptr = NULL;
   unsigned out = strtoul(in, &endptr, 10);
   if (*endptr != 0)
     fprintf(stderr, "invalid number in dec num\n");
@@ -176,7 +194,7 @@ parse_dec(char const* in)
 unsigned
 parse_hex(char const* in)
 {
-  char* endptr;
+  char* endptr = NULL;
   unsigned out = strtoul(in, &endptr, 16);
   if (*endptr != 0)
     fprintf(stderr, "invalid number in hex num\n");
@@ -205,7 +223,7 @@ parse_keyword(char const* text)
   exit(1);
 }
 
-extern int yylineno;
+extern const int yylineno;
 
 int
 yyerror(char const* err)
@@ -240,30 +258,31 @@ consumption_comparator(struct script_section** lhs, struct script_section** rhs)
 }
 
 #define INSERT_CONSUMPTION(segment, section)                                   \
-  if (segment->num_consumption + 1 >= MAX_INSERTIONS)                          \
+  if ((segment)->num_consumption + 1 >= MAX_INSERTIONS)                        \
     fprintf(stderr,                                                            \
             "too many section insertions into segment %s, remove sections or " \
             "recompile with a higher parameter\n",                             \
-            segment->name),                                                    \
+            (segment)->name),                                                  \
       exit(1);                                                                 \
-  segment->consumption[segment->num_consumption++] = section
+  (segment)->consumption[(segment)->num_consumption++] = section
 
 #define INSERT_CONSUMPTION_AT(segment, section, where)                         \
-  if (segment->num_consumption + 1 >= MAX_INSERTIONS)                          \
+  if ((segment)->num_consumption + 1 >= MAX_INSERTIONS)                        \
     fprintf(stderr,                                                            \
             "too many section insertions into segment %s, remove sections or " \
             "recompile with a higher parameter\n",                             \
-            segment->name),                                                    \
+            (segment)->name),                                                  \
       exit(1);                                                                 \
-  memmove(segment->consumption[where + 1],                                     \
-          segment->consumption[where],                                         \
-          (segment->num_consumption - where) * sizeof(*segment->consumption)); \
-  segment->consumption[where] = section, segment->num_consumption++
+  memmove((segment)->consumption[(where) + 1],                                 \
+          (segment)->consumption[where],                                       \
+          ((segment)->num_consumption - (where)) *                             \
+            sizeof(*(segment)->consumption));                                  \
+  (segment)->consumption[where] = (section), (segment)->num_consumption++
 
 #define SORT_CONSUMPTION(segment)                                              \
-  qsort(segment->consumption,                                                  \
-        segment->num_consumption,                                              \
-        sizeof *segment->consumption,                                          \
+  qsort((segment)->consumption,                                                \
+        (segment)->num_consumption,                                            \
+        sizeof *(segment)->consumption,                                        \
         (__compar_fn_t)consumption_comparator)
 
 /* generates a linear graph representing the "consumption" of space
@@ -281,11 +300,11 @@ compute_consumption()
     for (struct script_section* section = script_section_head; section;
          section = section->next) {
       /* this section does not appear within the segment, skip it */
-      if (strcmp(segment->name, section->name))
+      if (strcmp(segment->name, section->target_segment) != 0)
         continue;
 
       /* -1 is the marker for an indefinite section, skip em for now */
-      if (section->offset == -1u)
+      if (section->offset == -1U)
         break;
 
       INSERT_CONSUMPTION(segment, section);
@@ -344,7 +363,7 @@ compute_consumption()
   }
 }
 
-[[maybe_unused]] void
+void
 dump_consumption_graph(struct script_segment* segment)
 {
   printf("-- CONSUMPTION GRAPH <%s> --\n", segment->name);
@@ -367,7 +386,7 @@ detect_section_overlaps()
 
   for (struct script_segment* segment = script_segment_head; segment;
        segment = segment->next) {
-    // dump_consumption_graph(segment);
+    dump_consumption_graph(segment);
 
     for (unsigned i = 0; i < segment->num_consumption; i++) {
       struct script_section* section = segment->consumption[i];

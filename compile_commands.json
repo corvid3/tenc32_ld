@@ -1,0 +1,112 @@
+[
+    {
+        "arguments": [
+            "x86_64-pc-linux-gnu-cc",
+            "-c",
+            "-Iprivate",
+            "-Iinclude",
+            "-fdiagnostics-color=always",
+            "-Og",
+            "-g",
+            "-DHEWG_ORG=crow",
+            "-DHEWG_NAME=ccc_crowcpu_ld",
+            "-D_POSIX_C_SOURCE=200809L",
+            "-Wall",
+            "-Wextra",
+            "-std=c17",
+            "-I/home/korvo/.hewg/packages/crow.brbt-0.4.0:x86-linux-gnu/include",
+            "-I/home/korvo/.hewg/packages/crow.POFF_c-0.1.0:x86-linux-gnu/include",
+            "-I/home/korvo/.hewg/packages/crow.crowcpu_arch-0.1.0:x86-linux-gnu/include"
+        ],
+        "directory": "/home/korvo/gits/ccc-crowcpu-ld",
+        "file": "csrc/main.c"
+    },
+    {
+        "arguments": [
+            "x86_64-pc-linux-gnu-cc",
+            "-c",
+            "-Iprivate",
+            "-Iinclude",
+            "-fdiagnostics-color=always",
+            "-Og",
+            "-g",
+            "-DHEWG_ORG=crow",
+            "-DHEWG_NAME=ccc_crowcpu_ld",
+            "-D_POSIX_C_SOURCE=200809L",
+            "-Wall",
+            "-Wextra",
+            "-std=c17",
+            "-I/home/korvo/.hewg/packages/crow.brbt-0.4.0:x86-linux-gnu/include",
+            "-I/home/korvo/.hewg/packages/crow.POFF_c-0.1.0:x86-linux-gnu/include",
+            "-I/home/korvo/.hewg/packages/crow.crowcpu_arch-0.1.0:x86-linux-gnu/include"
+        ],
+        "directory": "/home/korvo/gits/ccc-crowcpu-ld",
+        "file": "csrc/script.c"
+    },
+    {
+        "arguments": [
+            "x86_64-pc-linux-gnu-cc",
+            "-c",
+            "-Iprivate",
+            "-Iinclude",
+            "-fdiagnostics-color=always",
+            "-Og",
+            "-g",
+            "-DHEWG_ORG=crow",
+            "-DHEWG_NAME=ccc_crowcpu_ld",
+            "-D_POSIX_C_SOURCE=200809L",
+            "-Wall",
+            "-Wextra",
+            "-std=c17",
+            "-I/home/korvo/.hewg/packages/crow.brbt-0.4.0:x86-linux-gnu/include",
+            "-I/home/korvo/.hewg/packages/crow.POFF_c-0.1.0:x86-linux-gnu/include",
+            "-I/home/korvo/.hewg/packages/crow.crowcpu_arch-0.1.0:x86-linux-gnu/include"
+        ],
+        "directory": "/home/korvo/gits/ccc-crowcpu-ld",
+        "file": "csrc/symbol.c"
+    },
+    {
+        "arguments": [
+            "x86_64-pc-linux-gnu-cc",
+            "-c",
+            "-Iprivate",
+            "-Iinclude",
+            "-fdiagnostics-color=always",
+            "-Og",
+            "-g",
+            "-DHEWG_ORG=crow",
+            "-DHEWG_NAME=ccc_crowcpu_ld",
+            "-D_POSIX_C_SOURCE=200809L",
+            "-Wall",
+            "-Wextra",
+            "-std=c17",
+            "-I/home/korvo/.hewg/packages/crow.brbt-0.4.0:x86-linux-gnu/include",
+            "-I/home/korvo/.hewg/packages/crow.POFF_c-0.1.0:x86-linux-gnu/include",
+            "-I/home/korvo/.hewg/packages/crow.crowcpu_arch-0.1.0:x86-linux-gnu/include"
+        ],
+        "directory": "/home/korvo/gits/ccc-crowcpu-ld",
+        "file": "csrc/y.tab.c"
+    },
+    {
+        "arguments": [
+            "x86_64-pc-linux-gnu-cc",
+            "-c",
+            "-Iprivate",
+            "-Iinclude",
+            "-fdiagnostics-color=always",
+            "-Og",
+            "-g",
+            "-DHEWG_ORG=crow",
+            "-DHEWG_NAME=ccc_crowcpu_ld",
+            "-D_POSIX_C_SOURCE=200809L",
+            "-Wall",
+            "-Wextra",
+            "-std=c17",
+            "-I/home/korvo/.hewg/packages/crow.brbt-0.4.0:x86-linux-gnu/include",
+            "-I/home/korvo/.hewg/packages/crow.POFF_c-0.1.0:x86-linux-gnu/include",
+            "-I/home/korvo/.hewg/packages/crow.crowcpu_arch-0.1.0:x86-linux-gnu/include"
+        ],
+        "directory": "/home/korvo/gits/ccc-crowcpu-ld",
+        "file": "csrc/lex.yy.c"
+    }
+]

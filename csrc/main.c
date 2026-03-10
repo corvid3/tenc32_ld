@@ -151,7 +151,7 @@ instr_reloc(uint32_t* word, uint32_t addr)
   tenc32_arch_decoded_instruction instr;
 
   if (!tenc32_arch_decode(&instr, *word))
-    fprintf(stderr, "invalid instruction\n"), exit(1);
+    fprintf(stderr, "invalid instruction: %i\n", *word), exit(1);
 
   switch (instr.instruction) {
     case TENC32_DECODED_MOVE:
@@ -184,7 +184,19 @@ instr_reloc(uint32_t* word, uint32_t addr)
       instr.payload.call_direct.offset = addr;
       break;
 
-    case TENC32_DECODED_TEST:
+    case TENC32_DECODED_BRANCH_EQ:
+    case TENC32_DECODED_BRANCH_NOTEQ:
+    case TENC32_DECODED_BRANCH_IGREATER:
+    case TENC32_DECODED_BRANCH_IGREATEREQ:
+    case TENC32_DECODED_BRANCH_UGREATER:
+    case TENC32_DECODED_BRANCH_UGREATEREQ:
+    case TENC32_DECODED_BRANCH_ZERO:
+    case TENC32_DECODED_BRANCH_NOT_ZERO:
+      instr.payload.branch.ip_addend = (signed short)addr;
+      break;
+
+    case TENC32_DECODED_MUL:
+    case TENC32_DECODED_SIGN_EXTEND:
     case TENC32_DECODED_AND:
     case TENC32_DECODED_OR:
     case TENC32_DECODED_XOR:
@@ -195,8 +207,6 @@ instr_reloc(uint32_t* word, uint32_t addr)
     case TENC32_DECODED_HALT:
     case TENC32_DECODED_LOAD:
     case TENC32_DECODED_STORE:
-    case TENC32_DECODED_PUSH:
-    case TENC32_DECODED_POP:
     case TENC32_DECODED_SYSINT:
     case TENC32_DECODED_SYSINTRET:
     case TENC32_DECODED_LCR:
@@ -409,25 +419,34 @@ relocate()
         exit(1);
       }
 
-      if (!find_segment(rel_symbol_section))
+      /* if the section wasn't assigned an output segment,
+       * then don't waste time relocating anything */
+      if (!segment_for_section(rel_symbol_section))
         continue;
 
       struct symbol* sym;
 
-      struct script_segment* point_to_seg = NULL;
+      struct script_section* outsection = NULL;
+      struct script_segment* segment = NULL;
       unsigned point_to = 0;
 
       /* static sym takes precedence */
       if ((sym = find_static_symbol(rel_symbol_name, rel_symbol_section))) {
-        point_to_seg = find_segment(sym->section);
+        outsection = find_section(sym->section);
+        assert(outsection);
+        segment = find_segment(outsection->target_segment);
+        assert(segment);
 
-        TENC32_SET_SEGMENT(point_to, point_to_seg->selector);
-        TENC32_SET_SEGMENT_OFFSET(point_to, sym->offset);
+        TENC32_SET_SEGMENT(point_to, segment->selector);
+        TENC32_SET_SEGMENT_OFFSET(point_to, outsection->offset + sym->offset);
       } else if ((sym = find_global_symbol(rel_symbol_name))) {
-        point_to_seg = find_segment(sym->section);
+        outsection = find_section(sym->section);
+        assert(outsection);
+        segment = find_segment(outsection->target_segment);
+        assert(segment);
 
-        TENC32_SET_SEGMENT(point_to, point_to_seg->selector);
-        TENC32_SET_SEGMENT_OFFSET(point_to, sym->offset);
+        TENC32_SET_SEGMENT(point_to, segment->selector);
+        TENC32_SET_SEGMENT_OFFSET(point_to, outsection->offset + sym->offset);
       } else {
         fprintf(stderr, "undefined symbol %s\n", rel_symbol_name);
         exit(1);
@@ -442,7 +461,7 @@ relocate()
           break;
 
         case POFF_RELOCATION_10c32_INSTR_HIGH:
-          instr_reloc(wordptr, point_to >> 16);
+          instr_reloc(wordptr, point_to >> 16U);
           break;
 
         case POFF_RELOCATION_10c32_INSTR_LOW:
@@ -470,7 +489,7 @@ relocate()
                     "distance relocation happens between multiple segments (%s "
                     "to %s) (%i to %i)\n",
                     instr_resting_segment->name,
-                    point_to_seg->name,
+                    outsection->name,
                     TENC32_GET_SEGMENT(pc),
                     TENC32_GET_SEGMENT(point_to)),
               exit(1);
@@ -483,6 +502,13 @@ relocate()
       }
     }
   }
+}
+
+static void
+padtil(FILE* outfile, unsigned const padding)
+{
+  for (unsigned i = 0; i < padding; i++)
+    fputc(0xAF, outfile);
 }
 
 static void
@@ -631,7 +657,7 @@ emit(char const* outpath)
       struct script_section* section_sym = find_section(entry_sym->section);
       entry = entry_sym->offset;
 
-      if (strcmp(code_segment_name, section_sym->target_segment))
+      if (strcmp(code_segment_name, section_sym->target_segment) != 0) {
         fprintf(stderr,
                 "entry symbol %s does not appear in the code segment %s, "
                 "rather it appears in %s\n",
@@ -639,6 +665,7 @@ emit(char const* outpath)
                 code_segment_name,
                 entry_sym->section),
           exit(1);
+      }
 
       fwrite(&entry, sizeof entry, 1, outfile);
       fwrite(&code_section, sizeof code_section, 1, outfile);
@@ -656,9 +683,10 @@ emit(char const* outpath)
       falignto(outfile, 32);
       for (unsigned i = 0; i < segment->num_consumption; i++) {
         struct script_section* sec = segment->consumption[i];
+        printf("OUTPUT SECTION: %s\n", sec->name);
 
         for (unsigned i = 0; i < num_files; i++) {
-          uint32_t idx;
+          uint32_t idx = 0;
           if (poff_find_section(&files[i].filedata, sec->name, &idx) !=
               POFF_NO_ERROR)
             continue;
@@ -667,7 +695,12 @@ emit(char const* outpath)
                  files[i].filedata.sections[idx].header.size,
                  outfile);
         }
+        if (i < segment->num_consumption - 1) {
+          struct script_section* nextsec = segment->consumption[i + 1];
+          padtil(outfile, nextsec->offset - (sec->offset + sec->length));
+        }
       }
+
       unsigned end = ftell(outfile);
       if (segment->capacity != -1u) {
         unsigned gap = segment->capacity - (end - begin);
